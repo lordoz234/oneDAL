@@ -47,6 +47,73 @@ using namespace daal::data_management;
 using namespace daal::services::internal;
 using namespace daal::algorithms::internal;
 
+template <typename WorkItem, CpuType cpu>
+class BinaryHeap
+{
+public:
+    BinaryHeap(services::Status & s)
+        : _capacity(1024),
+          _count(0),
+          _data(new WorkItem[_capacity]) { DAAL_CHECK_COND_ERROR(_data, s, services::ErrorMemoryAllocationFailed) }
+
+          BinaryHeap(const BinaryHeap &) = delete;
+
+    ~BinaryHeap()
+    {
+        delete[] _data;
+        _data = nullptr;
+    }
+
+    bool empty() const { return (_count == 0); }
+
+    WorkItem & pop()
+    {
+        DAAL_ASSERT(!empty());
+
+        popMaxHeap<cpu>(_data, _data + _count, [](const WorkItem & v1, const WorkItem & v2) -> bool { return v1.improvement < v2.improvement; });
+        --_count;
+        return _data[_count];
+    }
+
+    services::Status push(WorkItem & value)
+    {
+        if (_count == _capacity)
+        {
+            services::Status status = grow();
+            DAAL_CHECK_STATUS_VAR(status)
+        }
+        DAAL_ASSERT(_count < _capacity);
+
+        _data[_count++] = value;
+        makeMaxHeap<cpu>(_data, _data + _count, [](const WorkItem & v1, const WorkItem & v2) -> bool { return v1.improvement < v2.improvement; });
+        return services::Status();
+    }
+
+private:
+    services::Status grow()
+    {
+        DAAL_OVERFLOW_CHECK_BY_MULTIPLICATION(size_t, _capacity, 2);
+        const size_t newCapacity = _capacity * 2;
+        DAAL_ASSERT(_count < newCapacity);
+        WorkItem * const newData = new WorkItem[newCapacity];
+        DAAL_CHECK_MALLOC(newData)
+        for (size_t i = 0; i < _count; ++i)
+        {
+            newData[i] = _data[i];
+        }
+        delete[] _data;
+        _data     = newData;
+        _capacity = newCapacity;
+
+        return services::Status();
+    }
+
+    size_t _capacity; // capacity of the heap
+    size_t _count;    // counter of heap elements, the heap grows from left to right
+    WorkItem * _data; // array of heap elements, max element is on the left
+};
+
+
 typedef size_t TreeNodeIndex;
 typedef size_t LeavesDataIndex;
 
@@ -145,7 +212,7 @@ struct BaseCutPointFinder
                                data_management::features::FeatureType featureType, RandomIterator & greater,
                                typename SplitCriterion::ValueType & winnerSplitCriterionValue,
                                typename SplitCriterion::DataStatistics & winnerDataStatistics, GetIndependentValue getIndependentValue,
-                               GetDependentValue getDependentValue, GetWeight getWeight, Compare compare)
+                               GetDependentValue getDependentValue, GetWeight getWeight, Compare compare, size_t minSamplesLeaf)
     {
         auto winner = last;
         if (first != last)
@@ -169,6 +236,12 @@ struct BaseCutPointFinder
 
                     const size_t leftCount  = next - first;
                     const size_t rightCount = last - next;
+
+                    if (leftCount < minSamplesLeaf || rightCount < minSamplesLeaf) {
+                        i = next;
+                        continue;
+                    }
+
                     DAAL_ASSERT(leftCount + rightCount == totalCount);
 
                     const auto splitCriterionValue =
@@ -202,6 +275,16 @@ struct BaseCutPointFinder
 
                         const size_t leftCount  = next - i;
                         const size_t rightCount = totalCount - leftCount;
+
+                        if (leftCount < minSamplesLeaf || rightCount < minSamplesLeaf) {
+                            if (next == last)
+                            {
+                                break;
+                            }
+                            i = next;
+                            continue;
+                        }
+
                         DAAL_ASSERT(rightCount == (i - first) + (last - next));
 
                         const auto splitCriterionValue =
@@ -240,7 +323,7 @@ struct WeightedBaseCutPointFinder
                                data_management::features::FeatureType featureType, RandomIterator & greater,
                                typename SplitCriterion::ValueType & winnerSplitCriterionValue,
                                typename SplitCriterion::DataStatistics & winnerDataStatistics, GetIndependentValue getIndependentValue,
-                               GetDependentValue getDependentValue, GetWeight getWeight, Compare compare)
+                               GetDependentValue getDependentValue, GetWeight getWeight, Compare compare, size_t minSamplesLeaf)
     {
         double totalWeight          = 0.0;
         const size_t statisticsSize = totalDataStatistics.size();
@@ -778,7 +861,7 @@ public:
                 local->splitCriterion, items, &items[xRowCount], local->dataStatistics, totalDataStatistics, context.featureTypesCache[featureIndex],
                 next, local->splitCriterionValue, local->bestCutPointDataStatistics, [](const Item & v) -> IndependentVariableType { return v.x; },
                 [](const Item & v) -> DependentVariable { return v.y; }, [](const Item & v) -> IndependentVariableType { return v.w; },
-                [](const Item & v1, const Item & v2) -> bool { return v1.x < v2.x; });
+                [](const Item & v1, const Item & v2) -> bool { return v1.x < v2.x; }, context.minLeafSize);
 
             if (i != &items[xRowCount]
                 && (local->winnerIsLeaf || local->splitCriterionValue < local->winnerSplitCriterionValue
@@ -929,9 +1012,22 @@ public:
         services::Status statusPushBack;
         auto tni = pushBack(statusPushBack);
         DAAL_CHECK_STATUS_VAR(statusPushBack)
-        services::Status stat = (xColumnCount < threader_get_threads_number()) ?
+
+        bool f = false;
+
+        services::Status stat;
+
+        if (f) 
+        {
+            stat = (xColumnCount < threader_get_threads_number()) ?
                                     internalTrainFewFeatures(context, indexes, xRowCount, tni, totalDataStatistics, depthLimit) :
                                     internalTrainManyFeatures(context, indexes, xRowCount, tni, totalDataStatistics, depthLimit);
+
+        }
+        else
+        {
+            stat = BestFirstStrategy(context, indexes, xRowCount, tni, totalDataStatistics, depthLimit);
+        }
         DAAL_CHECK_STATUS_VAR(stat)
 
         if (w)
@@ -1201,7 +1297,7 @@ protected:
                 local->splitCriterion, items, &items[indexCount], local->dataStatistics, totalDataStatistics, context.featureTypesCache[featureIndex],
                 next, local->splitCriterionValue, local->bestCutPointDataStatistics, [](const Item & v) -> IndependentVariableType { return v.x; },
                 [](const Item & v) -> DependentVariable { return v.y; }, [](const Item & v) -> IndependentVariableType { return v.w; },
-                [](const Item & v1, const Item & v2) -> bool { return v1.x < v2.x; });
+                [](const Item & v1, const Item & v2) -> bool { return v1.x < v2.x; }, context.minLeafSize);
 
             if (i != &items[indexCount]
                 && (local->winnerIsLeaf || local->splitCriterionValue < local->winnerSplitCriterionValue
@@ -1302,6 +1398,393 @@ protected:
     }
 
     template <typename SplitCriterion, typename LeavesData>
+    services::Status BestFirstStrategy(const TrainigContext<SplitCriterion, LeavesData> & context, size_t * indexes, size_t indexCount,
+                                       TreeNodeIndex nodeIndex, const typename SplitCriterion::DataStatistics & totalDataStatistics,
+                                       size_t depthLimit) 
+    {
+        typedef typename SplitCriterion::DataStatistics DataStatistics;
+
+        DAAL_ASSERT(depthLimit != 0);
+        DAAL_ASSERT(context.minLeafSize >= 1);
+        DAAL_ASSERT(indexes);
+        DAAL_ASSERT(context.dx);
+        DAAL_ASSERT(context.dy);
+        DAAL_ASSERT((context.w == nullptr) == (context.dw == nullptr));
+
+        struct WorkItem
+        {
+            DataStatistics totalDataStatistics;
+            size_t firstIndex;
+            size_t lastIndex;
+            size_t depthLimit;
+            TreeNodeIndex nodeIndex;
+            double improvement;
+            size_t n;
+            bool isLeaf;
+
+            WorkItem() {}
+
+            WorkItem(const DataStatistics & stat, size_t firstIdx, size_t lastIdx, size_t depthLmt, TreeNodeIndex nodeIdx, const NumericTable * w, size_t n)
+                : totalDataStatistics(stat), firstIndex(firstIdx), lastIndex(lastIdx), depthLimit(depthLmt), nodeIndex(nodeIdx), improvement(0.0), n(n), isLeaf(true)
+            {}
+
+            void moveFrom(WorkItem & src)
+            {
+                DAAL_ASSERT(this != &src);
+
+                firstIndex  = src.firstIndex;
+                lastIndex   = src.lastIndex;
+                depthLimit  = src.depthLimit;
+                nodeIndex   = src.nodeIndex;
+                improvement = src.improvement;
+                n           = src.n;
+                isLeaf      = src.isLeaf;
+                totalDataStatistics.swap(src.totalDataStatistics);
+            }
+        };
+
+        SafeStatus safeStat;
+        services::Status statPush;
+        const size_t featureCount       = context.x.getNumberOfColumns();
+        const size_t numberOfSamples    = context.x.getNumberOfRows();
+        FeatureIndex winnerFeatureIndex = 0;
+        IndependentVariableType winnerCutPoint;
+        typename SplitCriterion::ValueType winnerSplitCriterionValue;
+        size_t winnerPointsAtLeft;
+        typename SplitCriterion::DataStatistics winnerDataStatistics;
+
+        char *maxleaf              = getenv("maxleaf");
+        size_t _maxLeafNodes       = 0;
+        sscanf(maxleaf, "%zu", &_maxLeafNodes);
+        size_t remainingSplitNodes = _maxLeafNodes - 1;
+
+        services::Status statusWorkItem;
+        BinaryHeap<WorkItem, cpu> binaryHeap(statusWorkItem);
+        DAAL_CHECK_STATUS_VAR(statusWorkItem);
+        WorkItem base(totalDataStatistics, 0, indexCount, depthLimit, nodeIndex, context.w, numberOfSamples);
+        statusWorkItem = binaryHeap.push(base);
+        DAAL_CHECK_STATUS_VAR(statusWorkItem) 
+
+        typename SplitCriterion::DependentVariableType leafDependentVariableValue;
+
+        while (!binaryHeap.empty())
+        {
+            WorkItem & src = binaryHeap.pop();
+            //std::cout << "INFO\n" << src.firstIndex << " " << src.lastIndex << " " << src.depthLimit << " "
+            //         << "impr: " << src.improvement << "\n";
+            const size_t indexCnt = src.lastIndex - src.firstIndex;
+            const IndependentVariableType sumWeights =
+                src.totalDataStatistics.sumWeights(src.firstIndex, src.lastIndex, const_cast<NumericTable *>(context.w));
+            //std::cout << remainingSplitNodes << "\n";
+            if (!remainingSplitNodes || src.depthLimit == 1 || indexCnt < context.minSplitSize || indexCnt < context.minLeafSize * 2)
+            {
+                services::Status statAdd;
+                auto lni = context.leavesData.add(src.totalDataStatistics, statAdd);
+                DAAL_CHECK_STATUS_VAR(statAdd);
+                src.isLeaf = 0;
+                //std::cout << "Leaf1\n";
+                makeLeaf(src.nodeIndex, src.totalDataStatistics.getBestDependentVariableValue(), lni,
+                        static_cast<double>(context.splitCriterion(src.totalDataStatistics, sumWeights)), static_cast<int>(indexCnt));
+            }
+            else if (src.totalDataStatistics.isPure(leafDependentVariableValue))
+            {
+                services::Status statAdd;
+                auto lni = context.leavesData.add(src.totalDataStatistics, statAdd);
+                DAAL_CHECK_STATUS_VAR(statAdd);
+                src.isLeaf = 0;
+                //std::cout << "Leaf2\n";
+                makeLeaf(src.nodeIndex, leafDependentVariableValue, lni,
+                        static_cast<double>(context.splitCriterion(src.totalDataStatistics, sumWeights)), static_cast<int>(indexCnt));
+            }
+            else
+            {
+                --remainingSplitNodes;
+                services::Status statFindSplit;
+                const bool winnerIsLeaf = !findSplitInParallel(
+                        context.splitCriterion, &indexes[src.firstIndex], src.lastIndex - src.firstIndex, context.featureTypesCache,
+                        src.totalDataStatistics, context.dx, context.dy, context.dw, featureCount, winnerFeatureIndex, winnerCutPoint,
+                        winnerSplitCriterionValue, winnerPointsAtLeft, winnerDataStatistics, statFindSplit, context.minLeafSize);
+                DAAL_CHECK_STATUS_VAR(statFindSplit)
+                //std::cout << winnerIsLeaf << " " << winnerPointsAtLeft << " " << indexCnt - winnerPointsAtLeft << "\n";
+                if (winnerIsLeaf || winnerPointsAtLeft < context.minLeafSize || indexCnt - winnerPointsAtLeft < context.minLeafSize)
+                {
+                    services::Status statAdd;
+                    auto lni = context.leavesData.add(src.totalDataStatistics, statAdd);
+                    DAAL_CHECK_STATUS_VAR(statAdd)
+                    src.isLeaf = 0;
+                    //std::cout << "Leaf3\n";
+                    makeLeaf(src.nodeIndex, src.totalDataStatistics.getBestDependentVariableValue(), lni,
+                             static_cast<double>(context.splitCriterion(src.totalDataStatistics, sumWeights)), static_cast<int>(indexCnt));
+                }
+                else
+                {
+                    services::Status statusMakeSplit = makeSplit(
+                            src.nodeIndex, winnerFeatureIndex, winnerCutPoint,
+                            static_cast<double>(context.splitCriterion(src.totalDataStatistics, sumWeights)), static_cast<int>(indexCnt));
+                    DAAL_CHECK_STATUS_VAR(statusMakeSplit)
+                    DAAL_ASSERT(!_nodes[src.nodeIndex].isLeaf());
+
+                    // Partition.
+                    size_t * splitIndexes = nullptr;
+                    switch (context.featureTypesCache[winnerFeatureIndex])
+                    {
+                        case data_management::features::DAAL_CATEGORICAL:
+                            splitIndexes = partition<cpu>(&indexes[src.firstIndex], &indexes[src.lastIndex],
+                                                          [winnerFeatureIndex, winnerCutPoint, &context](size_t i) -> bool {
+                                                              return (context.dx[winnerFeatureIndex][i] == winnerCutPoint);
+                                                          });
+                            break;
+
+                        case data_management::features::DAAL_ORDINAL:
+                        case data_management::features::DAAL_CONTINUOUS:
+                            splitIndexes = partition<cpu>(&indexes[src.firstIndex], &indexes[src.lastIndex],
+                                                          [winnerFeatureIndex, winnerCutPoint, &context](size_t i) -> bool {
+                                                              return (context.dx[winnerFeatureIndex][i] < winnerCutPoint);
+                                                          });
+                            break;
+
+                        default: DAAL_ASSERT(false); break;
+                    }
+                    DAAL_ASSERT(splitIndexes != nullptr);
+                    DAAL_ASSERT(splitIndexes >= &indexes[src.firstIndex]);
+                    DAAL_ASSERT(splitIndexes <= &indexes[src.lastIndex]);
+
+                    WorkItem leftChild, rightChild;
+
+                    leftChild.firstIndex  = src.firstIndex;
+                    leftChild.lastIndex   = splitIndexes - indexes;
+                    leftChild.depthLimit  = src.depthLimit - 1;
+                    leftChild.nodeIndex   = _nodes[src.nodeIndex].leftChildIndex();
+                    leftChild.n           = numberOfSamples;
+                    leftChild.totalDataStatistics.swap(winnerDataStatistics);
+
+                    rightChild.firstIndex = leftChild.lastIndex;
+                    rightChild.lastIndex  = src.lastIndex;
+                    rightChild.depthLimit = leftChild.depthLimit;
+                    rightChild.n          = numberOfSamples;
+                    rightChild.nodeIndex  = _nodes[src.nodeIndex].rightChildIndex();
+                    rightChild.totalDataStatistics.swap(src.totalDataStatistics);
+                    rightChild.totalDataStatistics -= leftChild.totalDataStatistics;
+
+                    if (leftChild.totalDataStatistics.isPure(leafDependentVariableValue))
+                    {
+                        leftChild.improvement = 0.0;
+                    }
+                    else
+                    {
+                        services::Status statFindSplit;
+                        const bool winnerIsLeaf = !findSplitInParallel(
+                                context.splitCriterion, &indexes[leftChild.firstIndex], leftChild.lastIndex - leftChild.firstIndex, context.featureTypesCache,
+                                leftChild.totalDataStatistics, context.dx, context.dy, context.dw, featureCount, winnerFeatureIndex, winnerCutPoint,
+                                winnerSplitCriterionValue, winnerPointsAtLeft, winnerDataStatistics, statFindSplit, context.minLeafSize);
+                        DAAL_CHECK_STATUS_VAR(statFindSplit)
+                        
+                        //|| winnerPointsAtLeft < context.minLeafSize || leftChild.lastIndex - leftChild.firstIndex - winnerPointsAtLeft < context.minLeafSize
+                        if (winnerIsLeaf) {
+                            leftChild.improvement = 0.0;
+                        }
+                        // Partition.
+                        else {
+                            size_t * splitIndexes = nullptr;
+                            switch (context.featureTypesCache[winnerFeatureIndex])
+                            {
+                                case data_management::features::DAAL_CATEGORICAL:
+                                    splitIndexes = partition<cpu>(&indexes[leftChild.firstIndex], &indexes[leftChild.lastIndex],
+                                                                      [winnerFeatureIndex, winnerCutPoint, &context](size_t i) -> bool {
+                                                                          return (context.dx[winnerFeatureIndex][i] == winnerCutPoint);
+                                                                    });
+                                    break;
+
+                                case data_management::features::DAAL_ORDINAL:
+                                case data_management::features::DAAL_CONTINUOUS:
+                                    splitIndexes = partition<cpu>(&indexes[leftChild.firstIndex], &indexes[leftChild.lastIndex],
+                                                                    [winnerFeatureIndex, winnerCutPoint, &context](size_t i) -> bool {
+                                                                        return (context.dx[winnerFeatureIndex][i] < winnerCutPoint);
+                                                                    });
+                                    break;
+
+                                default: DAAL_ASSERT(false); break;
+                            }
+                            DAAL_ASSERT(splitIndexes != nullptr);
+                            DAAL_ASSERT(splitIndexes >= &indexes[leftChild.firstIndex]);
+                            DAAL_ASSERT(splitIndexes <= &indexes[leftChild.lastIndex]);
+
+
+                            //std::cout << "INFO ABOUT LEFT\n";
+                            WorkItem l, r;
+
+                            //std::cout << splitIndexes << "\n";
+                            //std::cout << indexes << "\n";
+
+
+                            l.firstIndex  = leftChild.firstIndex;
+                            l.lastIndex   = splitIndexes - indexes;
+                            l.depthLimit  = leftChild.depthLimit - 1;
+                            l.n           = numberOfSamples;
+
+                            //std::cout << "info\n";
+                            l.totalDataStatistics.swap(winnerDataStatistics);
+
+
+                            r.firstIndex = l.lastIndex;
+                            r.lastIndex  = leftChild.lastIndex;
+                            r.depthLimit = l.depthLimit;
+                            r.n          = numberOfSamples;
+
+                            //std::cout << "info1\n";
+                            r.totalDataStatistics = leftChild.totalDataStatistics;
+
+                            //std::cout << "info2\n";
+
+                            //std::cout << l.firstIndex << " " << l.lastIndex << " " << r.firstIndex << " " << r.lastIndex << "\n";
+
+                            //std::cout << l.totalDataStatistics.sumWeights(l.firstIndex, l.lastIndex, const_cast<NumericTable *>(context.w)) << "\n";
+
+                            r.totalDataStatistics -= l.totalDataStatistics;
+
+                            //std::cout << l.firstIndex << " " << l.lastIndex << " " << r.firstIndex << " " << r.lastIndex << "\n";
+
+                            //std::cout << static_cast<double>(context.splitCriterion(l.totalDataStatistics, 
+                            //l.totalDataStatistics.sumWeights(l.firstIndex, l.lastIndex, const_cast<NumericTable *>(context.w)))) << "\n";
+
+                            double left = l.totalDataStatistics.sumWeights(l.firstIndex, l.lastIndex, const_cast<NumericTable *>(context.w)) 
+                                            / static_cast<double>(l.n) * static_cast<double>(context.splitCriterion(l.totalDataStatistics, 
+                            l.totalDataStatistics.sumWeights(l.firstIndex, l.lastIndex, const_cast<NumericTable *>(context.w))));
+
+                            //std::cout << left << "\n";
+
+                            //std::cout << static_cast<double>(context.splitCriterion(r.totalDataStatistics, 
+                            //r.totalDataStatistics.sumWeights(r.firstIndex, r.lastIndex, const_cast<NumericTable *>(context.w)))) << "\n";
+
+                            double right = r.totalDataStatistics.sumWeights(r.firstIndex, r.lastIndex, const_cast<NumericTable *>(context.w))
+                                            / static_cast<double>(r.n) * static_cast<double>(context.splitCriterion(r.totalDataStatistics, 
+                            r.totalDataStatistics.sumWeights(r.firstIndex, r.lastIndex, const_cast<NumericTable *>(context.w))));
+
+                            //std::cout << right << "\n";
+
+                            //std::cout << static_cast<double>(context.splitCriterion(leftChild.totalDataStatistics, 
+                            //leftChild.totalDataStatistics.sumWeights(leftChild.firstIndex, leftChild.lastIndex, const_cast<NumericTable *>(context.w)))) << "\n";
+
+                            double current = leftChild.totalDataStatistics.sumWeights(leftChild.firstIndex, leftChild.lastIndex, const_cast<NumericTable *>(context.w))
+                                            / static_cast<double>(leftChild.n) * static_cast<double>(context.splitCriterion(leftChild.totalDataStatistics, 
+                            leftChild.totalDataStatistics.sumWeights(leftChild.firstIndex, leftChild.lastIndex, const_cast<NumericTable *>(context.w))));
+
+                            //std::cout << current << "\n";
+
+                            //std::cout << "Watch: " << left << " " << right << " " << current << "\n";
+
+                            //std::cout << l.totalDataStatistics.sumWeights(l.firstIndex, l.lastIndex, const_cast<NumericTable *>(context.w)) << "\n";
+                            //std::cout << r.totalDataStatistics.sumWeights(r.firstIndex, r.lastIndex, const_cast<NumericTable *>(context.w)) << "\n";
+                            //std::cout << static_cast<double>(context.splitCriterion(l.totalDataStatistics, 
+                            //l.totalDataStatistics.sumWeights(l.firstIndex, l.lastIndex, const_cast<NumericTable *>(context.w)))) << "\n";
+                            //std::cout << static_cast<double>(context.splitCriterion(r.totalDataStatistics, 
+                            //r.totalDataStatistics.sumWeights(r.firstIndex, r.lastIndex, const_cast<NumericTable *>(context.w)))) << "\n";
+                            //std::cout << "END INFO\n";
+
+                            leftChild.improvement = current - left - right;
+                        }
+                    }
+
+                    if (rightChild.totalDataStatistics.isPure(leafDependentVariableValue))
+                    {
+                        rightChild.improvement = 0.0;
+                    }
+                    else
+                    {
+                        services::Status statFindSplit;
+                        const bool winnerIsLeaf = !findSplitInParallel(
+                                context.splitCriterion, &indexes[rightChild.firstIndex], rightChild.lastIndex - rightChild.firstIndex, context.featureTypesCache,
+                                rightChild.totalDataStatistics, context.dx, context.dy, context.dw, featureCount, winnerFeatureIndex, winnerCutPoint,
+                                winnerSplitCriterionValue, winnerPointsAtLeft, winnerDataStatistics, statFindSplit, context.minLeafSize);
+                        DAAL_CHECK_STATUS_VAR(statFindSplit)
+                        
+                        //|| winnerPointsAtLeft < context.minLeafSize || rightChild.lastIndex - rightChild.firstIndex - winnerPointsAtLeft < context.minLeafSize
+                        if (winnerIsLeaf) {
+                            rightChild.improvement = 0.0;
+                        }
+
+                        else {
+
+                            // Partition.
+                            size_t * splitIndexes = nullptr;
+                            switch (context.featureTypesCache[winnerFeatureIndex])
+                            {
+                                case data_management::features::DAAL_CATEGORICAL:
+                                    splitIndexes = partition<cpu>(&indexes[rightChild.firstIndex], &indexes[rightChild.lastIndex],
+                                                                      [winnerFeatureIndex, winnerCutPoint, &context](size_t i) -> bool {
+                                                                          return (context.dx[winnerFeatureIndex][i] == winnerCutPoint);
+                                                                    });
+                                    break;
+
+                                case data_management::features::DAAL_ORDINAL:
+                                case data_management::features::DAAL_CONTINUOUS:
+                                    splitIndexes = partition<cpu>(&indexes[rightChild.firstIndex], &indexes[rightChild.lastIndex],
+                                                                    [winnerFeatureIndex, winnerCutPoint, &context](size_t i) -> bool {
+                                                                        return (context.dx[winnerFeatureIndex][i] < winnerCutPoint);
+                                                                    });
+                                    break;
+
+                                default: DAAL_ASSERT(false); break;
+                            }
+                            DAAL_ASSERT(splitIndexes != nullptr);
+                            DAAL_ASSERT(splitIndexes >= &indexes[rightChild.firstIndex]);
+                            DAAL_ASSERT(splitIndexes <= &indexes[rightChild.lastIndex]);
+
+
+                            //std::cout << "INFO ABOUT RIGHT\n";
+                            WorkItem l, r;
+
+                            l.firstIndex  = rightChild.firstIndex;
+                            l.lastIndex   = splitIndexes - indexes;
+                            l.depthLimit  = rightChild.depthLimit - 1;
+                            l.n           = numberOfSamples;
+                            l.totalDataStatistics.swap(winnerDataStatistics);
+
+                            r.firstIndex = l.lastIndex;
+                            r.lastIndex  = rightChild.lastIndex;
+                            r.depthLimit = l.depthLimit;
+                            r.n          = numberOfSamples;
+                            r.totalDataStatistics = rightChild.totalDataStatistics;
+                            r.totalDataStatistics -= l.totalDataStatistics;
+
+                            double left = l.totalDataStatistics.sumWeights(l.firstIndex, l.lastIndex, const_cast<NumericTable *>(context.w)) 
+                                            / static_cast<double>(l.n) * static_cast<double>(context.splitCriterion(l.totalDataStatistics, 
+                            l.totalDataStatistics.sumWeights(l.firstIndex, l.lastIndex, const_cast<NumericTable *>(context.w))));
+
+                            double right = r.totalDataStatistics.sumWeights(r.firstIndex, r.lastIndex, const_cast<NumericTable *>(context.w))
+                                            / static_cast<double>(r.n) * static_cast<double>(context.splitCriterion(r.totalDataStatistics, 
+                            r.totalDataStatistics.sumWeights(r.firstIndex, r.lastIndex, const_cast<NumericTable *>(context.w))));
+
+                            double current = rightChild.totalDataStatistics.sumWeights(rightChild.firstIndex, rightChild.lastIndex, const_cast<NumericTable *>(context.w))
+                                            / static_cast<double>(rightChild.n) * static_cast<double>(context.splitCriterion(rightChild.totalDataStatistics, 
+                            rightChild.totalDataStatistics.sumWeights(rightChild.firstIndex, rightChild.lastIndex, const_cast<NumericTable *>(context.w))));
+
+                            //std::cout << "Watch: " << left << " " << right << " " << current << "\n";
+
+                            //std::cout << l.totalDataStatistics.sumWeights(l.firstIndex, l.lastIndex, const_cast<NumericTable *>(context.w)) << "\n";
+                            //std::cout << r.totalDataStatistics.sumWeights(r.firstIndex, r.lastIndex, const_cast<NumericTable *>(context.w)) << "\n";
+                            //std::cout << static_cast<double>(context.splitCriterion(l.totalDataStatistics, 
+                            //l.totalDataStatistics.sumWeights(l.firstIndex, l.lastIndex, const_cast<NumericTable *>(context.w)))) << "\n";
+                            //std::cout << static_cast<double>(context.splitCriterion(r.totalDataStatistics, 
+                            //r.totalDataStatistics.sumWeights(r.firstIndex, r.lastIndex, const_cast<NumericTable *>(context.w)))) << "\n";
+                            //std::cout << "END INFO\n";
+
+                            rightChild.improvement = current - left - right;
+                        }
+                    }
+
+                    statPush = binaryHeap.push(leftChild);
+                    DAAL_CHECK_STATUS_VAR(statPush)
+                    statPush = binaryHeap.push(rightChild);
+                    DAAL_CHECK_STATUS_VAR(statPush)
+                }
+            }
+        }
+
+        return services::Status();
+    }
+
+    template <typename SplitCriterion, typename LeavesData>
     services::Status internalTrainFewFeatures(const TrainigContext<SplitCriterion, LeavesData> & context, size_t * indexes, size_t indexCount,
                                               TreeNodeIndex nodeIndex, const typename SplitCriterion::DataStatistics & totalDataStatistics,
                                               size_t depthLimit)
@@ -1395,7 +1878,7 @@ protected:
                     const bool winnerIsLeaf = !findSplitInParallel(
                         context.splitCriterion, &indexes[workItem.firstIndex], workItem.lastIndex - workItem.firstIndex, context.featureTypesCache,
                         workItem.totalDataStatistics, context.dx, context.dy, context.dw, featureCount, winnerFeatureIndex, winnerCutPoint,
-                        winnerSplitCriterionValue, winnerPointsAtLeft, winnerDataStatistics, statFindSplit);
+                        winnerSplitCriterionValue, winnerPointsAtLeft, winnerDataStatistics, statFindSplit, context.minLeafSize);
                     DAAL_CHECK_STATUS_VAR(statFindSplit)
                     if (winnerIsLeaf || winnerPointsAtLeft < context.minLeafSize || indexCnt - winnerPointsAtLeft < context.minLeafSize)
                     {
@@ -1517,7 +2000,7 @@ protected:
                                 !findSplitInParallel(localSplitCriterion, &indexes[workItem.firstIndex], workItem.lastIndex - workItem.firstIndex,
                                                      context.featureTypesCache, workItem.totalDataStatistics, context.dx, context.dy, context.dw,
                                                      featureCount, winnerFeatureIndex, winnerCutPoint, winnerSplitCriterionValue, winnerPointsAtLeft,
-                                                     winnerDataStatistics, statFindSplit);
+                                                     winnerDataStatistics, statFindSplit, context.minLeafSize);
                             DAAL_CHECK_STATUS_THR(statFindSplit)
                             if (winnerIsLeaf || winnerPointsAtLeft < context.minLeafSize || indexCnt - winnerPointsAtLeft < context.minLeafSize)
                             {
@@ -1695,7 +2178,7 @@ protected:
                                 !findSplitInSerial(localSplitCriterion, &indexes[workItem.firstIndex], workItem.lastIndex - workItem.firstIndex,
                                                    context.featureTypesCache, workItem.totalDataStatistics, context.dx, context.dy, context.dw,
                                                    featureCount, winnerFeatureIndex, winnerCutPoint, winnerSplitCriterionValue, winnerPointsAtLeft,
-                                                   winnerDataStatistics, statFindSplit);
+                                                   winnerDataStatistics, statFindSplit, 1);
                             DAAL_CHECK_STATUS_THR(statFindSplit)
                             if (winnerIsLeaf || winnerPointsAtLeft < context.minLeafSize || indexCnt - winnerPointsAtLeft < context.minLeafSize)
                             {
@@ -1792,7 +2275,7 @@ protected:
                              const IndependentVariableType * const * dx, const DependentVariableType * dy, const IndependentVariableType * dw,
                              size_t featureCount, FeatureIndex & winnerFeatureIndex, IndependentVariableType & winnerCutPoint,
                              typename SplitCriterion::ValueType & winnerSplitCriterionValue, size_t & winnerPointsAtLeft,
-                             typename SplitCriterion::DataStatistics & winnerDataStatistics, services::Status & status)
+                             typename SplitCriterion::DataStatistics & winnerDataStatistics, services::Status & status, size_t minSamplesLeaf)
     {
         typedef daal::internal::Math<typename SplitCriterion::ValueType, cpu> SplitCriterionMath;
         typedef daal::services::internal::EpsilonVal<typename SplitCriterion::ValueType> SplitCriterionEpsilon;
@@ -1869,7 +2352,7 @@ protected:
                     next, local->splitCriterionValue, local->bestCutPointDataStatistics,
                     [](const Item & v) -> IndependentVariableType { return v.x; }, [](const Item & v) -> DependentVariable { return v.y; },
                     [](const Item & v) -> IndependentVariableType { return v.w; },
-                    [](const Item & v1, const Item & v2) -> bool { return v1.x < v2.x; });
+                    [](const Item & v1, const Item & v2) -> bool { return v1.x < v2.x; }, minSamplesLeaf);
 
                 if (i != &items[indexCount]
                     && (local->winnerIsLeaf || local->splitCriterionValue < local->winnerSplitCriterionValue
@@ -1928,7 +2411,7 @@ protected:
                            const DependentVariableType * dy, const IndependentVariableType * dw, size_t featureCount,
                            FeatureIndex & winnerFeatureIndex, IndependentVariableType & winnerCutPoint,
                            typename SplitCriterion::ValueType & winnerSplitCriterionValue, size_t & winnerPointsAtLeft,
-                           typename SplitCriterion::DataStatistics & winnerDataStatistics, services::Status & status)
+                           typename SplitCriterion::DataStatistics & winnerDataStatistics, services::Status & status, size_t minSamplesLeaf)
     {
         typedef daal::internal::Math<typename SplitCriterion::ValueType, cpu> SplitCriterionMath;
         typedef daal::services::internal::EpsilonVal<typename SplitCriterion::ValueType> SplitCriterionEpsilon;
@@ -1995,7 +2478,7 @@ protected:
                     next, local->splitCriterionValue, local->bestCutPointDataStatistics,
                     [](const Item & v) -> IndependentVariableType { return v.x; }, [](const Item & v) -> DependentVariable { return v.y; },
                     [](const Item & v) -> IndependentVariableType { return v.w; },
-                    [](const Item & v1, const Item & v2) -> bool { return v1.x < v2.x; });
+                    [](const Item & v1, const Item & v2) -> bool { return v1.x < v2.x; }, minSamplesLeaf);
 
                 if (i != &items[indexCount]
                     && (local->winnerIsLeaf || local->splitCriterionValue < local->winnerSplitCriterionValue
