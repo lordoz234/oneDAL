@@ -33,6 +33,8 @@
 #include "src/services/service_defines.h"
 #include "src/algorithms/distributions/uniform/uniform_kernel.h"
 
+#include <iostream>
+
 using namespace daal::algorithms::dtrees::training::internal;
 using namespace daal::algorithms::internal;
 
@@ -556,7 +558,7 @@ protected:
     size_t nFeatures() const { return _data->getNumberOfColumns(); }
     typename DataHelper::NodeType::Base * buildDepthFirst(services::Status & s, size_t iStart, size_t n, size_t level,
                                                           typename DataHelper::ImpurityData & curImpurity, bool & bUnorderedFeaturesUsed,
-                                                          size_t nClasses, algorithmFPType totalWeights);
+                                                          size_t nClasses, algorithmFPType totalWeights, algorithmFPType * data);
     typename DataHelper::NodeType::Base * buildBestFirst(services::Status & s, size_t iStart, size_t n, size_t level,
                                                          typename DataHelper::ImpurityData & curImpurity, bool & bUnorderedFeaturesUsed,
                                                          size_t nClasses, algorithmFPType totalWeights);
@@ -594,9 +596,9 @@ protected:
     typename DataHelper::NodeType::Leaf * makeLeaf(const IndexType * idx, size_t n, typename DataHelper::ImpurityData & imp, size_t makeLeaf);
 
     bool findBestSplit(size_t level, size_t iStart, size_t n, const typename DataHelper::ImpurityData & curImpurity, IndexType & iBestFeature,
-                       typename DataHelper::TSplitData & split, algorithmFPType totalWeights);
+                       typename DataHelper::TSplitData & split, algorithmFPType totalWeights, algorithmFPType * data);
     bool findBestSplitSerial(size_t level, size_t iStart, size_t n, const typename DataHelper::ImpurityData & curImpurity, IndexType & iBestFeature,
-                             typename DataHelper::TSplitData & split, algorithmFPType totalWeights);
+                             typename DataHelper::TSplitData & split, algorithmFPType totalWeights, algorithmFPType * data);
     bool findBestSplitThreaded(size_t level, size_t iStart, size_t n, const typename DataHelper::ImpurityData & curImpurity, IndexType & iBestFeature,
                                typename DataHelper::TSplitData & split, algorithmFPType totalWeights);
     bool simpleSplit(size_t iStart, const typename DataHelper::ImpurityData & curImpurity, IndexType & iFeatureBest,
@@ -749,11 +751,24 @@ services::Status TrainBatchTaskBase<algorithmFPType, BinIndexType, DataHelper, c
     {
         _helper.template calcImpurity<false>(_aSample.get(), _nSamples, initialImpurity, totalWeights);
     }
+
+    size_t rows = _data->getNumberOfRows();
+    algorithmFPType * data = new algorithmFPType[_data->getNumberOfColumns() * rows];
+
+    for (size_t j = 0; j < _data->getNumberOfColumns(); ++j) {
+        BlockDescriptor<algorithmFPType> yBD;
+        const_cast<NumericTable *>(_data)->getBlockOfColumnValues(0, j, rows, readOnly, yBD);
+        const algorithmFPType * const dataF = yBD.getBlockPtr();
+        for (size_t index = 0; index < rows; ++index) {
+            data[index + j * rows] = dataF[index];
+        }
+    }
+
     bool bUnorderedFeaturesUsed = false;
     services::Status s;
     typename DataHelper::NodeType::Base * nd =
         _maxLeafNodes ? buildBestFirst(s, 0, _nSamples, 0, initialImpurity, bUnorderedFeaturesUsed, _nClasses, totalWeights) :
-                        buildDepthFirst(s, 0, _nSamples, 0, initialImpurity, bUnorderedFeaturesUsed, _nClasses, totalWeights);
+                        buildDepthFirst(s, 0, _nSamples, 0, initialImpurity, bUnorderedFeaturesUsed, _nClasses, totalWeights, data);
     if (nd)
     {
         //to prevent memory leak in case of general allocator
@@ -796,9 +811,12 @@ typename DataHelper::NodeType::Leaf * TrainBatchTaskBase<algorithmFPType, BinInd
 template <typename algorithmFPType, typename BinIndexType, typename DataHelper, CpuType cpu>
 typename DataHelper::NodeType::Base * TrainBatchTaskBase<algorithmFPType, BinIndexType, DataHelper, cpu>::buildDepthFirst(
     services::Status & s, size_t iStart, size_t n, size_t level, typename DataHelper::ImpurityData & curImpurity, bool & bUnorderedFeaturesUsed,
-    size_t nClasses, algorithmFPType totalWeights)
+    size_t nClasses, algorithmFPType totalWeights, algorithmFPType * data)
 {
     const size_t maxFeatures = nFeatures();
+
+    //std::cout << "maxFeatures: " << maxFeatures << "\n";
+
     if (_hostApp.isCancelled(s, n)) return nullptr;
 
     if (!_par.memorySavingMode && !_useConstFeatures)
@@ -821,8 +839,10 @@ typename DataHelper::NodeType::Base * TrainBatchTaskBase<algorithmFPType, BinInd
 
     typename DataHelper::TSplitData split;
     IndexType iFeature;
-    if (findBestSplit(level, iStart, n, curImpurity, iFeature, split, totalWeights))
+    //std::cout << "Start-End:= " << iStart << " " << n << "\n";
+    if (findBestSplit(level, iStart, n, curImpurity, iFeature, split, totalWeights, data))
     {
+        //std::cout << "Feautre: " << iFeature << "\n";
         const size_t nLeft   = split.nLeft;
         const double imp     = curImpurity.var;
         const double impLeft = split.left.var;
@@ -833,10 +853,10 @@ typename DataHelper::NodeType::Base * TrainBatchTaskBase<algorithmFPType, BinInd
             return makeLeaf(_aSample.get() + iStart, n, curImpurity, nClasses);
         if (_par.varImportance == training::MDI) addImpurityDecrease(iFeature, n, curImpurity, split);
         typename DataHelper::NodeType::Base * left =
-            buildDepthFirst(s, iStart, split.nLeft, level + 1, split.left, bUnorderedFeaturesUsed, nClasses, split.leftWeights);
+            buildDepthFirst(s, iStart, split.nLeft, level + 1, split.left, bUnorderedFeaturesUsed, nClasses, split.leftWeights, data);
         _helper.convertLeftImpToRight(n, curImpurity, split);
         typename DataHelper::NodeType::Base * right =
-            s.ok() ? buildDepthFirst(s, iStart + nLeft, split.nLeft, level + 1, split.left, bUnorderedFeaturesUsed, nClasses, split.leftWeights) :
+            s.ok() ? buildDepthFirst(s, iStart + nLeft, split.nLeft, level + 1, split.left, bUnorderedFeaturesUsed, nClasses, split.leftWeights, data) :
                      nullptr;
         typename DataHelper::NodeType::Base * res = nullptr;
         if (!left || !right || !(res = makeSplit(iFeature, split.featureValue, split.featureUnordered, left, right, curImpurity.var)))
@@ -867,7 +887,7 @@ typename DataHelper::NodeType::Base * TrainBatchTaskBase<algorithmFPType, BinInd
     {
         return makeLeaf(_aSample.get() + item.start, item.n, impurity, nClasses);
     }
-    else if (findBestSplit(level, item.start, item.n, impurity, iFeature, split, item.totalWeights))
+    else if (findBestSplit(level, item.start, item.n, impurity, iFeature, split, item.totalWeights, nullptr))
     {
         const double imp     = impurity.var;
         const double impLeft = split.left.var;
@@ -1070,7 +1090,7 @@ bool TrainBatchTaskBase<algorithmFPType, BinIndexType, DataHelper, cpu>::findBes
                                                                                        const typename DataHelper::ImpurityData & curImpurity,
                                                                                        IndexType & iFeatureBest,
                                                                                        typename DataHelper::TSplitData & split,
-                                                                                       algorithmFPType totalWeights)
+                                                                                       algorithmFPType totalWeights, algorithmFPType * data)
 {
     if (n == 2)
     {
@@ -1080,7 +1100,7 @@ bool TrainBatchTaskBase<algorithmFPType, BinIndexType, DataHelper, cpu>::findBes
 #endif
         return simpleSplit(iStart, curImpurity, iFeatureBest, split);
     }
-    if (_nFeatureBufs == 1) return findBestSplitSerial(level, iStart, n, curImpurity, iFeatureBest, split, totalWeights);
+    if (_nFeatureBufs == 1) return findBestSplitSerial(level, iStart, n, curImpurity, iFeatureBest, split, totalWeights, data);
     return findBestSplitThreaded(level, iStart, n, curImpurity, iFeatureBest, split, totalWeights);
 }
 
@@ -1090,8 +1110,9 @@ bool TrainBatchTaskBase<algorithmFPType, BinIndexType, DataHelper, cpu>::findBes
                                                                                              const typename DataHelper::ImpurityData & curImpurity,
                                                                                              IndexType & iBestFeature,
                                                                                              typename DataHelper::TSplitData & bestSplit,
-                                                                                             algorithmFPType totalWeights)
+                                                                                             algorithmFPType totalWeights, algorithmFPType * dataF)
 {
+    //std::cout << "findBestSplitSerial\n";
     chooseFeatures();
     size_t nVisitedFeature       = 0;
     const size_t maxFeatures     = nFeatures();
@@ -1102,10 +1123,14 @@ bool TrainBatchTaskBase<algorithmFPType, BinIndexType, DataHelper, cpu>::findBes
     int idxFeatureValueBestSplit = -1; //when sorted feature is used
     typename DataHelper::TSplitData split;
     const float fact = float(n);
+
     for (size_t i = 0; i < maxFeatures && nVisitedFeature < _nFeaturesPerNode; ++i)
     {
+        //std::cout << "i:= " << i << "\n";
         const auto iFeature            = _aFeatureIdx[i];
         const bool bUseIndexedFeatures = (!_par.memorySavingMode) && (fact > qMax * float(_helper.indexedFeatures().numIndices(iFeature)));
+
+        //std::cout << "Use:= " << bUseIndexedFeatures << "\n";
 
         if (!_maxLeafNodes && !_useConstFeatures && !_par.memorySavingMode)
         {
@@ -1128,13 +1153,90 @@ bool TrainBatchTaskBase<algorithmFPType, BinIndexType, DataHelper, cpu>::findBes
 
         if (bUseIndexedFeatures)
         {
+            auto samples = _aSample.get();
+            //ReadRows<algorithmFPType, cpu> p(const_cast<NumericTable *>(_data), 0, 1);
+            //ReadColumns<algorithmFPType, cpu> p(const_cast<NumericTable *>(_data), i, 0, _data->getNumberOfRows());
+            
+            //const algorithmFPType* dataF = p.get();
+
+            //BlockDescriptor<algorithmFPType> yBD;
+            //const_cast<NumericTable *>(_data)->getBlockOfColumnValues(0, i, _data->getNumberOfRows(), readOnly, yBD);
+            //const algorithmFPType * const dataF = yBD.getBlockPtr();
+            
+            algorithmFPType mini = dataF[i * _data->getNumberOfRows() + aIdx[0]];
+            algorithmFPType maxi = dataF[i * _data->getNumberOfRows() + aIdx[0]];
+            
+            PRAGMA_IVDEP
+            PRAGMA_VECTOR_ALWAYS
+            for (size_t j = 0; j < n; j++) {
+                mini = std::min(mini, dataF[i * _data->getNumberOfRows() + aIdx[j]]);
+                maxi = std::max(maxi, dataF[i * _data->getNumberOfRows() + aIdx[j]]);
+            }
+ 
+            //std::cout << "Uniform:= " << rng.uniform(1, &uniform, _engineImpl->getState(), 0, n) << "\n";
+            //std::cout << "Uniform1:= " << uniform << "\n";
+ 
+            RNGs<double, cpu> rngD;
+            double unif;
+ 
+            //std::cout << "Minimax:= " << mini << " " << maxi << "\n";
+ 
+            rngD.uniform(1, &unif, _engineImpl->getState(), mini, maxi);
+ 
+            //std::cout << "Uniform2:= " << unif << "\n";
+ 
+            int idxF = -1;
+            algorithmFPType dist;
+            size_t index = 0;
+            
+            PRAGMA_IVDEP
+            PRAGMA_VECTOR_ALWAYS
+            for (size_t j = 0; j < n; j++) {
+                if (dataF[i * _data->getNumberOfRows() + aIdx[j]] > unif) {
+                    continue;
+                }
+                else {
+                    dist = unif - dataF[i * _data->getNumberOfRows() + aIdx[j]];
+                    index = j;
+                    idxF = aIdx[j];
+                    break;
+                }
+            }
+
+            PRAGMA_IVDEP
+            PRAGMA_VECTOR_ALWAYS
+            for (size_t j = index + 1; j < n; j++) {
+                if (dataF[i * _data->getNumberOfRows() + aIdx[j]] > unif) {
+                    continue;
+                }
+                else {
+                    if (unif - dataF[i * _data->getNumberOfRows() + aIdx[j]] <= dist) {
+                        dist = unif - dataF[i * _data->getNumberOfRows() + aIdx[j]];
+                        idxF = aIdx[j];
+                    }
+                }
+            }
+ 
+            //std::cout << dist << " " << idxF << "\n";
+
+            //int idxF = aIdx[idxF];
+
+            BinIndexType bin = _binIndex[_data->getNumberOfRows() * iFeature + idxF];
+            
+            //std::cout << "Bin:= " << bin << "\n";
+
             split.featureUnordered = _featHelper.isUnordered(iFeature);
             //index of best feature value in the array of sorted feature values
             const int idxFeatureValue =
                 _helper.findBestSplitForFeatureSorted(featureBuf(0), iFeature, aIdx, n, _par.minObservationsInLeafNode, curImpurity, split,
-                                                      _minWeightLeaf, totalWeights, _binIndex + _data->getNumberOfRows() * iFeature);
+                                                      _minWeightLeaf, totalWeights, _binIndex + _data->getNumberOfRows() * iFeature, bin);
+            
+            //std::cout << "idxFeatureValue: " << idxFeatureValue << "\n";
+
             if (idxFeatureValue < 0) continue;
             iBestSplit = i;
+
+            //std::cout << "iBestSplit: " << iBestSplit << "\n";
             split.copyTo(bestSplit);
             idxFeatureValueBestSplit = idxFeatureValue;
         }
